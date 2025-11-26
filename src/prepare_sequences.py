@@ -2,8 +2,8 @@
 import os, csv, numpy as np, pandas as pd
 from transforms import ensure_63_from_xy, reorder_to_training_order, normalize_by_wrist, canonicalize_left_hand
 
-STATIC_CSV = "data/sasl_landmarks.csv"
-DYN_DIR = "data/dynamic_dataset"
+STATIC_CSV = "../data/sasl_landmarks.csv"
+DYN_DIR = "../data/dynamic_dataset"
 OUT_DIR = "data/sequences"
 MANIFEST = "data/manifest.csv"
 SEQ_LEN = 30
