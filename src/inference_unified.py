@@ -78,7 +78,7 @@ print("Loaded unified model:", MODEL_PATH)
 # ---------------------------
 mp_hands = mp.solutions.hands
 mp_draw = mp.solutions.drawing_utils
-hands = mp_hands.Hands(max_num_hands=1, model_complexity=0,
+hands = mp_hands.Hands(max_num_hands=2, model_complexity=0,
                        min_detection_confidence=0.6, min_tracking_confidence=0.6)
 
 # ---------------------------
@@ -107,15 +107,19 @@ def softmax(x):
 # ---------------------------
 # Rolling buffer, smoothing
 # ---------------------------
-buffer = deque(maxlen=SEQ_LEN)
-pred_history = deque(maxlen=SMOOTH_WINDOW)
+# Separate buffers for left and right hands
+buffer_left = deque(maxlen=SEQ_LEN)
+buffer_right = deque(maxlen=SEQ_LEN)
+pred_history_left = deque(maxlen=SMOOTH_WINDOW)
+pred_history_right = deque(maxlen=SMOOTH_WINDOW)
 
 cap = cv2.VideoCapture(0)
 if not cap.isOpened():
     raise RuntimeError("Camera not accessible")
 
 print("Starting inference. Press ESC to quit.")
-last_announced = None
+last_announced_left = None
+last_announced_right = None
 last_time = 0.0
 DEBOUNCE_SEC = 0.6
 
@@ -126,57 +130,80 @@ while True:
     frame = cv2.flip(frame, 1)
     rgb = cv2.cvtColor(frame, cv2.COLOR_BGR2RGB)
     res = hands.process(rgb)
-    pred_text = "no_hand"
-    handedness = "Unknown"
+    
+    pred_text_left = "no_hand"
+    pred_text_right = "no_hand"
 
     if res.multi_hand_landmarks:
-        lm = res.multi_hand_landmarks[0]
-        if res.multi_handedness:
-            handedness = res.multi_handedness[0].classification[0].label
-
-        try:
-            feat = preprocess_frame_from_mediapipe(lm.landmark, handedness)
-        except Exception as e:
-            print("Preprocess error:", e)
-            continue
-
-        buffer.append(feat)
-
-        mp_draw.draw_landmarks(frame, lm, mp_hands.HAND_CONNECTIONS)
-
-        if len(buffer) >= SEQ_LEN:
-            seq = np.stack(list(buffer)[-SEQ_LEN:]).astype(np.float32)  # (T, D)
-            with torch.no_grad():
-                xin = torch.from_numpy(seq).float().unsqueeze(0).to(DEVICE)  # (1,T,D)
-                out = model(xin)
-                probs = torch.softmax(out, dim=1).cpu().numpy().squeeze()
-                pred_idx = int(np.argmax(probs))
-                conf = float(probs[pred_idx])
-                pred_label = idx2label.get(pred_idx, "?")
-
-            # smoothing
-            pred_history.append((pred_label, conf))
-            # compute moving average by labels: choose mode with average conf
-            # simple heur: if last SMOOTH_WINDOW preds agree, announce
-            labels = [p for p, c in pred_history]
-            if len(labels) >= SMOOTH_WINDOW and all(x == labels[-1] for x in labels[-SMOOTH_WINDOW:]):
-                if conf >= CONF_THRESH:
-                    pred_text = f"{pred_label} ({conf:.2f})"
-                    now = time.time()
-                    if pred_text != last_announced and (now - last_time) > DEBOUNCE_SEC:
-                        print(f"[{time.strftime('%H:%M:%S')}] {pred_text}")
-                        last_announced = pred_text
-                        last_time = now
+        # Process each detected hand
+        for hand_idx, lm in enumerate(res.multi_hand_landmarks):
+            if hand_idx < len(res.multi_handedness):
+                handedness = res.multi_handedness[hand_idx].classification[0].label
             else:
-                pred_text = f"{pred_label} ({conf:.2f})"
-        else:
-            pred_text = f"collecting {len(buffer)}/{SEQ_LEN}"
+                handedness = "Unknown"
+
+            try:
+                feat = preprocess_frame_from_mediapipe(lm.landmark, handedness)
+            except Exception as e:
+                print(f"Preprocess error for {handedness} hand:", e)
+                continue
+
+            # Route to appropriate buffer based on handedness
+            if handedness.lower().startswith("l"):
+                buffer = buffer_left
+                pred_history = pred_history_left
+                pred_text_var = "pred_text_left"
+            else:
+                buffer = buffer_right
+                pred_history = pred_history_right
+                pred_text_var = "pred_text_right"
+
+            buffer.append(feat)
+
+            # Draw landmarks
+            mp_draw.draw_landmarks(frame, lm, mp_hands.HAND_CONNECTIONS)
+
+            if len(buffer) >= SEQ_LEN:
+                seq = np.stack(list(buffer)[-SEQ_LEN:]).astype(np.float32)  # (T, D)
+                with torch.no_grad():
+                    xin = torch.from_numpy(seq).float().unsqueeze(0).to(DEVICE)  # (1,T,D)
+                    out = model(xin)
+                    probs = torch.softmax(out, dim=1).cpu().numpy().squeeze()
+                    pred_idx = int(np.argmax(probs))
+                    conf = float(probs[pred_idx])
+                    pred_label = idx2label.get(pred_idx, "?")
+
+                # smoothing
+                pred_history.append((pred_label, conf))
+                labels = [p for p, c in pred_history]
+                if len(labels) >= SMOOTH_WINDOW and all(x == labels[-1] for x in labels[-SMOOTH_WINDOW:]):
+                    if conf >= CONF_THRESH:
+                        pred_text = f"{pred_label} ({conf:.2f})"
+                        now = time.time()
+                        last_announced = last_announced_left if handedness.lower().startswith("l") else last_announced_right
+                        if pred_text != last_announced and (now - last_time) > DEBOUNCE_SEC:
+                            print(f"[{time.strftime('%H:%M:%S')}] {handedness}: {pred_text}")
+                            if handedness.lower().startswith("l"):
+                                last_announced_left = pred_text
+                            else:
+                                last_announced_right = pred_text
+                            last_time = now
+                else:
+                    pred_text = f"{pred_label} ({conf:.2f})"
+            else:
+                pred_text = f"collecting {len(buffer)}/{SEQ_LEN}"
+
+            # Update the appropriate pred_text variable
+            if handedness.lower().startswith("l"):
+                pred_text_left = pred_text
+            else:
+                pred_text_right = pred_text
 
     # overlays
-    cv2.putText(frame, pred_text, (10, frame.shape[0]-50), cv2.FONT_HERSHEY_SIMPLEX, 1.0, (0,255,0), 2)
-    cv2.putText(frame, f"Hand: {handedness}", (10, frame.shape[0]-80), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (255,255,0), 2)
+    cv2.putText(frame, f"LEFT: {pred_text_left}", (10, frame.shape[0]-50), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0,255,0), 2)
+    cv2.putText(frame, f"RIGHT: {pred_text_right}", (10, frame.shape[0]-80), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (255,0,0), 2)
 
-    cv2.imshow("Unified Inference", frame)
+    cv2.imshow("Unified Inference - Both Hands", frame)
     key = cv2.waitKey(1) & 0xFF
     if key == 27:
         break
